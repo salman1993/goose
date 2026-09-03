@@ -51,18 +51,32 @@ macro_rules! string_enum {
 string_enum!(ThinkingType { Adaptive => "adaptive", Enabled => "enabled", Disabled => "disabled" });
 string_enum!(CacheTtl { FiveMinutes => "5m", OneHour => "1h" });
 
+string_enum!(PrefixMismatchBehavior { DropBlock => "drop_block", Error => "error" });
+
+pub const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+pub const INPUT_TRANSFORMATIONS_FIELD: &str = "input_transformations";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnthropicFormatOptions {
     pub preserve_unsigned_thinking: bool,
     pub preserve_thinking_context: bool,
     pub thinking_disabled: bool,
     pub emit_clear_thinking: bool,
-    pub current_model: Option<String>,
     pub prompt_cache_disabled: bool,
     pub cache_ttl: Option<CacheTtl>,
+    pub prefix_mismatch_behavior: Option<PrefixMismatchBehavior>,
+    pub strip_thinking_history: bool,
 }
 
 impl AnthropicFormatOptions {
+    /// Anthropic-compatible providers keep `Default`, which does not request block binding.
+    pub fn native() -> Self {
+        Self {
+            prefix_mismatch_behavior: Some(PrefixMismatchBehavior::DropBlock),
+            ..Self::default()
+        }
+    }
+
     fn for_model(self, model_config: &ModelConfig) -> Self {
         let preserve_thinking_context = model_config
             .request_param::<bool>("preserve_thinking_context")
@@ -80,17 +94,24 @@ impl AnthropicFormatOptions {
             .cache_ttl()
             .and_then(|ttl| ttl.parse::<CacheTtl>().ok())
             .or(self.cache_ttl);
+        let prefix_mismatch_behavior = match model_config
+            .request_param::<String>("prefix_mismatch_behavior")
+            .as_deref()
+        {
+            None => self.prefix_mismatch_behavior,
+            Some("off") => None,
+            Some(value) => value.parse::<PrefixMismatchBehavior>().ok(),
+        };
 
         Self {
             preserve_unsigned_thinking,
             preserve_thinking_context,
             thinking_disabled,
             emit_clear_thinking,
-            current_model: self
-                .current_model
-                .or_else(|| Some(model_config.model_name.clone())),
             prompt_cache_disabled: model_config.prompt_cache_disabled(),
             cache_ttl,
+            prefix_mismatch_behavior,
+            strip_thinking_history: self.strip_thinking_history,
         }
     }
 
@@ -247,7 +268,7 @@ fn format_messages_with_options(
             Role::Assistant => ASSISTANT_ROLE,
         };
 
-        let thinking_is_stale = thinking_block_is_stale(message, options.current_model.as_deref());
+        let replay_thinking = !options.thinking_disabled && !options.strip_thinking_history;
 
         let mut content = Vec::new();
         for msg_content in &message.content {
@@ -401,15 +422,13 @@ fn format_messages_with_options(
                 }
                 MessageContentBlock::Thinking(thinking) => {
                     // Anthropic rejects thinking blocks sent without a matching thinking config.
-                    if !options.thinking_disabled {
+                    if replay_thinking {
                         if !thinking.signature.is_empty() {
-                            if !thinking_is_stale {
-                                content.push(json!({
-                                    TYPE_FIELD: THINKING_TYPE,
-                                    THINKING_TYPE: thinking.thinking,
-                                    SIGNATURE_FIELD: thinking.signature
-                                }));
-                            }
+                            content.push(json!({
+                                TYPE_FIELD: THINKING_TYPE,
+                                THINKING_TYPE: thinking.thinking,
+                                SIGNATURE_FIELD: thinking.signature
+                            }));
                         } else if options.preserve_unsigned_thinking
                             && !thinking.thinking.is_empty()
                         {
@@ -421,7 +440,7 @@ fn format_messages_with_options(
                     }
                 }
                 MessageContentBlock::RedactedThinking(redacted) => {
-                    if !options.thinking_disabled && !thinking_is_stale {
+                    if replay_thinking {
                         content.push(json!({
                             TYPE_FIELD: REDACTED_THINKING_TYPE,
                             DATA_FIELD: redacted.data
@@ -688,6 +707,22 @@ pub fn get_usage(data: &Value) -> Result<Usage> {
 /// Anthropic response fields that have no canonical `ProviderUsage` equivalent.
 const ADDITIONAL_USAGE_FIELDS: [&str; 1] = ["service_tier"];
 
+pub fn input_transformations(message_data: &Value) -> Option<Value> {
+    let transformations = message_data.get(INPUT_TRANSFORMATIONS_FIELD)?.as_array()?;
+    let prefix_mismatches: Vec<&str> = transformations
+        .iter()
+        .filter(|t| t.get("reason").and_then(|r| r.as_str()) == Some("prefix_binding_mismatch"))
+        .filter_map(|t| t.get("path").and_then(|p| p.as_str()))
+        .collect();
+    if !prefix_mismatches.is_empty() {
+        tracing::warn!(
+            paths = ?prefix_mismatches,
+            "API dropped thinking blocks because the conversation prefix changed since they were produced"
+        );
+    }
+    Some(Value::Array(transformations.clone()))
+}
+
 pub fn get_additional_data(data: &Value) -> Option<Map<String, Value>> {
     let usage = data.get("usage")?.as_object()?;
     let additional: Map<String, Value> = ADDITIONAL_USAGE_FIELDS
@@ -809,6 +844,33 @@ fn apply_thinking_config(
     {
         obj.insert("thinking".to_string(), json!({"type": "disabled"}));
     }
+
+    // `block_binding` is only accepted alongside adaptive or enabled thinking.
+    if let Some(behavior) = options.prefix_mismatch_behavior {
+        if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+            if thinking.get("type").and_then(|t| t.as_str()) != Some("disabled") {
+                thinking.insert(
+                    "block_binding".to_string(),
+                    json!({"prefix_mismatch_behavior": behavior.to_string()}),
+                );
+            }
+        }
+    }
+}
+
+pub fn block_binding_behavior(payload: &Value) -> Option<PrefixMismatchBehavior> {
+    payload
+        .pointer("/thinking/block_binding/prefix_mismatch_behavior")
+        .and_then(Value::as_str)
+        .and_then(|behavior| behavior.parse().ok())
+}
+
+pub fn is_thinking_signature_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("thinking")
+        && (lower.contains("signature")
+            || lower.contains("cannot be modified")
+            || lower.contains("block_binding"))
 }
 
 pub fn create_request(
@@ -973,6 +1035,11 @@ where
                 EVENT_MESSAGE_START => {
                     if let Some(message_data) = event.data.get("message") {
                         additional_data = get_additional_data(message_data);
+                        if let Some(transformations) = input_transformations(message_data) {
+                            additional_data
+                                .get_or_insert_with(Map::new)
+                                .insert(INPUT_TRANSFORMATIONS_FIELD.to_string(), transformations);
+                        }
                         if let Some(id) = message_data.get("id").and_then(|v| v.as_str()) {
                             message_id = Some(id.to_string());
                         }
@@ -1067,7 +1134,8 @@ where
                 }
                 EVENT_CONTENT_BLOCK_STOP => {
                     if let Some(state) = thinking.take() {
-                        if !state.text.is_empty() {
+                        // Omitted thinking arrives as an empty string with a signature and must still be replayed.
+                        if !state.text.is_empty() || !state.signature.is_empty() {
                             let mut message = Message::assistant()
                                 .with_thinking(state.text, state.signature);
                             message.id = message_id.clone();
@@ -1540,48 +1608,13 @@ mod tests {
     }
 
     #[test]
-    fn drops_signed_thinking_from_a_different_model() {
-        let messages = vec![signed_thinking_from_model("claude-opus-4-1")];
-        let opts = AnthropicFormatOptions {
-            current_model: Some("claude-sonnet-4-5".to_string()),
-            ..Default::default()
-        };
-        let spec = format_messages_with_options(&messages, &opts);
-        let types: Vec<&str> = spec[0]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| c["type"].as_str().unwrap())
-            .collect();
-        assert!(
-            !types.contains(&"thinking"),
-            "stale thinking must be dropped"
-        );
-        assert!(types.contains(&"text"), "text content must be preserved");
-    }
-
-    #[test]
-    fn keeps_signed_thinking_from_the_same_model() {
-        let messages = vec![signed_thinking_from_model("claude-sonnet-4-5")];
-        let opts = AnthropicFormatOptions {
-            current_model: Some("claude-sonnet-4-5".to_string()),
-            ..Default::default()
-        };
+    fn keeps_signed_thinking_from_a_different_model() {
+        let messages = vec![signed_thinking_from_model("claude-opus-4-8")];
+        let opts = AnthropicFormatOptions::default().for_model(&ModelConfig::new("claude-opus-5"));
         let spec = format_messages_with_options(&messages, &opts);
         assert_eq!(spec[0]["content"][0]["type"], "thinking");
         assert_eq!(spec[0]["content"][0]["signature"], "sig-abc");
-    }
-
-    #[test]
-    fn keeps_signed_thinking_when_provenance_unknown() {
-        let messages =
-            vec![Message::assistant().with_content(MessageContent::thinking("internal", "sig"))];
-        let opts = AnthropicFormatOptions {
-            current_model: Some("claude-sonnet-4-5".to_string()),
-            ..Default::default()
-        };
-        let spec = format_messages_with_options(&messages, &opts);
-        assert_eq!(spec[0]["content"][0]["type"], "thinking");
+        assert_eq!(spec[0]["content"][1]["type"], "text");
     }
 
     #[test]

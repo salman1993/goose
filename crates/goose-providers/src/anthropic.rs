@@ -8,7 +8,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use reqwest::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io;
 use tokio::pin;
 use tokio_util::io::StreamReader;
@@ -16,8 +16,9 @@ use tokio_util::io::StreamReader;
 use super::api_client::ApiClient;
 use super::base::{ConfigKey, MessageStream, ModelInfo, Provider, ProviderMetadata};
 use super::formats::anthropic::{
-    create_request_for_model, response_to_streaming_message, AnthropicFormatOptions,
-    ANTHROPIC_PROVIDER_NAME,
+    block_binding_behavior, create_request_for_model, is_thinking_signature_error,
+    response_to_streaming_message, AnthropicFormatOptions, PrefixMismatchBehavior,
+    ANTHROPIC_PROVIDER_NAME, INPUT_TRANSFORMATIONS_FIELD, THINKING_BINDING_CONTROLS_BETA,
 };
 use super::openai_compatible::handle_status;
 use super::retry::ProviderRetry;
@@ -27,6 +28,7 @@ use rmcp::model::Tool;
 
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-5";
 const ANTHROPIC_KNOWN_MODELS: &[&str] = &[
+    "claude-fable-5-1",
     "claude-opus-5",
     "claude-sonnet-5",
     "claude-fable-5",
@@ -162,6 +164,47 @@ impl AnthropicProviderBuilder {
 }
 
 impl AnthropicProvider {
+    fn streaming_payload(
+        &self,
+        model_config: &ModelConfig,
+        wire_model: &str,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+        format_options: AnthropicFormatOptions,
+    ) -> Result<Value, ProviderError> {
+        let mut payload = create_request_for_model(
+            ANTHROPIC_PROVIDER_NAME,
+            model_config,
+            wire_model,
+            system,
+            messages,
+            tools,
+            format_options,
+        )?;
+        payload["stream"] = Value::Bool(true);
+        Ok(payload)
+    }
+
+    async fn post_messages(
+        &self,
+        model_config: &ModelConfig,
+        payload: &Value,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let beta_header = beta_header_value(&self.api_client, model_config, payload);
+        self.with_retry(|| async {
+            let mut request = self
+                .api_client
+                .request("v1/messages")
+                .model_headers(model_config)?;
+            if let Some(beta) = &beta_header {
+                request = request.header("anthropic-beta", beta)?;
+            }
+            handle_status(request.streaming(true).response_post(payload).await?).await
+        })
+        .await
+    }
+
     pub async fn stream_for_model(
         &self,
         model_config: &ModelConfig,
@@ -170,8 +213,7 @@ impl AnthropicProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let mut payload = create_request_for_model(
-            ANTHROPIC_PROVIDER_NAME,
+        let payload = self.streaming_payload(
             model_config,
             wire_model,
             system,
@@ -179,24 +221,33 @@ impl AnthropicProvider {
             tools,
             self.format_options.clone(),
         )?;
-        payload["stream"] = Value::Bool(true);
         let mut log = start_log(model_config, &payload)?;
-        let response = self
-            .with_retry(|| async {
-                handle_status(
-                    self.api_client
-                        .request("v1/messages")
-                        .model_headers(model_config)?
-                        .streaming(true)
-                        .response_post(&payload)
-                        .await?,
-                )
-                .await
-            })
-            .await
-            .inspect_err(|e| {
-                let _ = log.error(e);
-            })?;
+        let response = match self.post_messages(model_config, &payload).await {
+            Err(ProviderError::RequestFailed(message))
+                if is_thinking_signature_error(&message)
+                    && !self.format_options.strip_thinking_history
+                    && block_binding_behavior(&payload) != Some(PrefixMismatchBehavior::Error) =>
+            {
+                tracing::warn!(
+                    error = %message,
+                    "API rejected replayed thinking blocks; retrying once with thinking history stripped. \
+                     The rejected blocks stay in the session, so later requests may repeat this retry"
+                );
+                let _ = log.error(&message);
+                let stripped = AnthropicFormatOptions {
+                    strip_thinking_history: true,
+                    ..self.format_options.clone()
+                };
+                let payload =
+                    self.streaming_payload(model_config, wire_model, system, messages, tools, stripped)?;
+                log = start_log(model_config, &payload)?;
+                self.post_messages(model_config, &payload).await
+            }
+            other => other,
+        }
+        .inspect_err(|e| {
+            let _ = log.error(e);
+        })?;
         let stream = response.bytes_stream().map_err(io::Error::other);
         Ok(Box::pin(try_stream! {
             let reader = StreamReader::new(stream);
@@ -205,6 +256,13 @@ impl AnthropicProvider {
             pin!(messages);
             while let Some(message) = futures::StreamExt::next(&mut messages).await {
                 let (message, usage) = message.map_err(ProviderError::from_stream_error)?;
+                if let Some(transformations) = usage
+                    .as_ref()
+                    .and_then(|usage| usage.additional_data.as_ref())
+                    .and_then(|data| data.get(INPUT_TRANSFORMATIONS_FIELD))
+                {
+                    log.write(&json!({ INPUT_TRANSFORMATIONS_FIELD: transformations }), None)?;
+                }
                 log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
                 yield (message, usage);
             }
@@ -385,6 +443,38 @@ impl Provider for AnthropicProvider {
         )
         .await
     }
+}
+
+fn beta_header_value(
+    api_client: &ApiClient,
+    model_config: &ModelConfig,
+    payload: &Value,
+) -> Option<String> {
+    let mut features: Vec<String> = model_config
+        .request_headers
+        .as_ref()
+        .and_then(|headers| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("anthropic-beta"))
+                .map(|(_, value)| value.as_str())
+        })
+        .or_else(|| api_client.default_header("anthropic-beta"))
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if block_binding_behavior(payload).is_some()
+        && !features.iter().any(|f| f == THINKING_BINDING_CONTROLS_BETA)
+    {
+        features.push(THINKING_BINDING_CONTROLS_BETA.to_string());
+    }
+    (!features.is_empty()).then(|| features.join(","))
 }
 
 fn format_options_for_provider(
@@ -753,6 +843,166 @@ mod tests {
             matches!(err, ProviderError::Authentication(_)),
             "expected Authentication error, got: {:?}",
             err
+        );
+    }
+
+    fn test_client(host: &str) -> ApiClient {
+        ApiClient::new_with_tls(host.to_string(), AuthMethod::NoAuth, None).unwrap()
+    }
+
+    fn provider_for(
+        api_client: ApiClient,
+        format_options: AnthropicFormatOptions,
+    ) -> AnthropicProvider {
+        AnthropicProvider {
+            api_client,
+            supports_streaming: true,
+            name: ANTHROPIC_PROVIDER_NAME.to_string(),
+            custom_models: None,
+            dynamic_models: None,
+            skip_canonical_filtering: false,
+            format_options,
+        }
+    }
+
+    fn thinking_model(name: &str) -> ModelConfig {
+        ModelConfig::new(name).with_merged_request_params(std::collections::HashMap::from([(
+            "thinking_effort".to_string(),
+            json!("high"),
+        )]))
+    }
+
+    const SSE_OK: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_omitted\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    async fn drain(stream: MessageStream) -> Vec<Message> {
+        use futures::StreamExt;
+        let mut messages = Vec::new();
+        let mut stream = stream;
+        while let Some(item) = stream.next().await {
+            if let Some(message) = item.expect("stream item").0 {
+                messages.push(message);
+            }
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn stream_sends_block_binding_and_merges_beta_header() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({
+                "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(
+            test_client(&server.uri())
+                .with_header("anthropic-beta", "context-1m-2025-08-07")
+                .unwrap(),
+            AnthropicFormatOptions::native(),
+        );
+        let stream = provider
+            .stream(
+                &thinking_model("claude-opus-5"),
+                "system",
+                &[Message::user().with_text("hi")],
+                &[],
+            )
+            .await
+            .expect("request accepted");
+        let messages = drain(stream).await;
+        assert!(matches!(
+            &messages[0].content[0],
+            MessageContent::Thinking(t) if t.thinking.is_empty() && t.signature == "sig_omitted"
+        ));
+
+        let requests = server.received_requests().await.unwrap();
+        let betas: Vec<&str> = requests[0]
+            .headers
+            .get_all("anthropic-beta")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            betas,
+            vec!["context-1m-2025-08-07,thinking-binding-controls-2026-08-01"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_retries_once_without_thinking_after_signature_rejection() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_string_contains("\"signature\""))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation."
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(
+            test_client(&server.uri()),
+            AnthropicFormatOptions::default(),
+        );
+        let history = vec![
+            Message::user().with_text("hi"),
+            Message::assistant()
+                .with_content(MessageContent::thinking("", "sig-from-elsewhere"))
+                .with_text("hello"),
+            Message::user().with_text("again"),
+        ];
+        let stream = provider
+            .stream(&thinking_model("claude-opus-5"), "system", &history, &[])
+            .await
+            .expect("second attempt accepted");
+        drain(stream).await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let retry: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            retry["messages"][1]["content"],
+            json!([{"type": "text", "text": "hello"}])
         );
     }
 }
